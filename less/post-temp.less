@@ -1,0 +1,97 @@
+body {
+	&#post, &#subpage {
+		header {
+			margin: 0 auto;
+			padding: 1em 2rem;
+			.opacity(0.4);
+			-moz-transition-property: opacity;
+			-webkit-transition-property: opacity;
+			-o-transition-property: opacity;
+			transition-property: opacity;
+			.transition-duration(.4s);
+			&:hover {
+				.opacity(1);
+			}
+
+			h1 {
+				font-size: 1.6em;
+			}
+		}
+		article {
+			h2#title.dated {
+				margin-bottom: 0.5em;
+			}
+			time.dt-published {
+				display: block;
+				color: #666;
+				margin-bottom: 1em;
+			}
+		}
+	}
+}
+
+article, pre, .hljs, #wrapper.archive ul {
+	padding: 0.5em 2rem 1.5em;
+}
+body#post article, pre, .hljs {
+	font-size: 1.2em;
+}
+
+p.split {
+	color: #6161FF;
+	font-style: italic;
+	font-size: 0.86em;
+}
+
+#readmore-sell {
+	padding: 1em 1em 2em;
+	background-color: #fafafa;
+	p.split {
+		color: black;
+		font-style: normal;
+		font-size: 1.4em;
+	}
+	.cta + .cta {
+		margin-left: 0.5em;
+	}
+}
+
+/* Post mixins */
+.article-code() {
+	background-color: #f8f8f8;
+	border: 1px solid #ccc;
+	padding: 0.2em 0.4em;
+	font-size: 0.86em;
+	.rounded(.25em);
+}
+.article-blockquote() {
+	border-left: 4px solid #ddd;
+	padding: 0 1em;
+	margin: 0.5em;
+	color: #767676;
+	display: inline-block;
+
+	p {
+		display: block;
+		margin: 0.5em 0;
+	}
+}
+.article-p() {
+	line-height: 1.5;
+	white-space: pre-wrap;       /* CSS 3 */
+	white-space: -moz-pre-wrap;  /* Mozilla, since 1999 */
+	white-space: -pre-wrap;      /* Opera 4-6 */
+	white-space: -o-pre-wrap;    /* Opera 7 */
+	word-wrap: break-word;       /* Internet Explorer 5.5+ */
+}
+.article-title() {
+	font-size: 1.5em;
+	display: block;
+	margin-top: 0;
+	margin-bottom: 1em;
+}
+
+.hljs {
+	overflow-x: inherit;
+	background: transparent;
+}

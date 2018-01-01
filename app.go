@@ -1,0 +1,1162 @@
+/*
+ * Copyright © 2018-2021 Musing Studio LLC.
+ *
+ * This file is part of WriteFreely.
+ *
+ * WriteFreely is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License, included
+ * in the LICENSE file in this source code package.
+ */
+
+package writefreely
+
+import (
+	"crypto/tls"
+	"database/sql"
+	_ "embed"
+	"fmt"
+	"html/template"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"syscall"
+	"text/tabwriter"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/gorilla/schema"
+	"github.com/gorilla/sessions"
+	"github.com/manifoldco/promptui"
+	stripmd "github.com/writeas/go-strip-markdown/v2"
+	"github.com/writeas/impart"
+	"github.com/writeas/web-core/auth"
+	"github.com/writeas/web-core/converter"
+	"github.com/writeas/web-core/log"
+	"golang.org/x/crypto/acme/autocert"
+
+	"github.com/writefreely/writefreely/author"
+	"github.com/writefreely/writefreely/config"
+	"github.com/writefreely/writefreely/key"
+	"github.com/writefreely/writefreely/migrations"
+	"github.com/writefreely/writefreely/page"
+)
+
+const (
+	staticDir        = "static"
+	assumedTitleLen  = 80
+	postsPerPage     = 10
+	postsPerArchPage = 40
+
+	serverSoftware = "WriteFreely"
+	softwareURL    = "https://writefreely.org"
+)
+
+var (
+	debugging bool
+
+	// Software version can be set from git env using -ldflags
+	softwareVer = "0.17.2"
+
+	// DEPRECATED VARS
+	isSingleUser bool
+)
+
+// App holds data and configuration for an individual WriteFreely instance.
+type App struct {
+	router       *mux.Router
+	shttp        *http.ServeMux
+	db           *datastore
+	cfg          *config.Config
+	cfgFile      string
+	keys         *key.Keychain
+	sessionStore sessions.Store
+	formDecoder  *schema.Decoder
+	updates      *updatesCache
+
+	timeline *localTimeline
+}
+
+// DB returns the App's datastore
+func (app *App) DB() *datastore {
+	return app.db
+}
+
+// Router returns the App's router
+func (app *App) Router() *mux.Router {
+	return app.router
+}
+
+// Config returns the App's current configuration.
+func (app *App) Config() *config.Config {
+	return app.cfg
+}
+
+// SetConfig updates the App's Config to the given value.
+func (app *App) SetConfig(cfg *config.Config) {
+	app.cfg = cfg
+}
+
+// SetKeys updates the App's Keychain to the given value.
+func (app *App) SetKeys(k *key.Keychain) {
+	app.keys = k
+}
+
+func (app *App) SessionStore() sessions.Store {
+	return app.sessionStore
+}
+
+func (app *App) SetSessionStore(s sessions.Store) {
+	app.sessionStore = s
+}
+
+// Apper is the interface for getting data into and out of a WriteFreely
+// instance (or "App").
+//
+// App returns the App for the current instance.
+//
+// LoadConfig reads an app configuration into the App, returning any error
+// encountered.
+//
+// SaveConfig persists the current App configuration.
+//
+// LoadKeys reads the App's encryption keys and loads them into its
+// key.Keychain.
+type Apper interface {
+	App() *App
+
+	LoadConfig() error
+	SaveConfig(*config.Config) error
+
+	LoadKeys() error
+
+	ReqLog(r *http.Request, status int, timeSince time.Duration) string
+}
+
+// App returns the App
+func (app *App) App() *App {
+	return app
+}
+
+// LoadConfig loads and parses a config file.
+func (app *App) LoadConfig() error {
+	log.Info("Loading %s configuration...", app.cfgFile)
+	cfg, err := config.Load(app.cfgFile)
+	if err != nil {
+		log.Error("Unable to load configuration: %v", err)
+		os.Exit(1)
+		return err
+	}
+	app.cfg = cfg
+	return nil
+}
+
+// SaveConfig saves the given Config to disk -- namely, to the App's cfgFile.
+func (app *App) SaveConfig(c *config.Config) error {
+	return config.Save(c, app.cfgFile)
+}
+
+// LoadKeys reads all needed keys from disk into the App. In order to use the
+// configured `Server.KeysParentDir`, you must call initKeyPaths(App) before
+// this.
+func (app *App) LoadKeys() error {
+	var err error
+	app.keys = &key.Keychain{}
+
+	if debugging {
+		log.Info("  %s", emailKeyPath)
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		executable = "writefreely"
+	} else {
+		executable = filepath.Base(executable)
+	}
+
+	app.keys.EmailKey, err = os.ReadFile(emailKeyPath)
+	if err != nil {
+		return err
+	}
+
+	if debugging {
+		log.Info("  %s", cookieAuthKeyPath)
+	}
+	app.keys.CookieAuthKey, err = os.ReadFile(cookieAuthKeyPath)
+	if err != nil {
+		return err
+	}
+
+	if debugging {
+		log.Info("  %s", cookieKeyPath)
+	}
+	app.keys.CookieKey, err = os.ReadFile(cookieKeyPath)
+	if err != nil {
+		return err
+	}
+
+	if debugging {
+		log.Info("  %s", csrfKeyPath)
+	}
+	app.keys.CSRFKey, err = os.ReadFile(csrfKeyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Error(`Missing key: %s.
+
+  Run this command to generate missing keys:
+    %s keys generate
+
+`, csrfKeyPath, executable)
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (app *App) ReqLog(r *http.Request, status int, timeSince time.Duration) string {
+	return fmt.Sprintf("\"%s %s\" %d %s \"%s\"", r.Method, r.RequestURI, status, timeSince, r.UserAgent())
+}
+
+// handleViewHome shows page at root path. It checks the configuration and
+// authentication state to show the correct page.
+func handleViewHome(app *App, w http.ResponseWriter, r *http.Request) error {
+	if app.cfg.App.SingleUser {
+		// Render blog index
+		return handleViewCollection(app, w, r)
+	}
+
+	// Multi-user instance
+	forceLanding := r.FormValue("landing") == "1"
+	if !forceLanding {
+		// Show correct page based on user auth status and configured landing path
+		u := getUserSession(app, r)
+
+		if app.cfg.App.Chorus {
+			// This instance is focused on reading, so show Reader on home route if not
+			// private or a private-instance user is logged in.
+			if !app.cfg.App.Private || u != nil {
+				return viewLocalTimeline(app, w, r)
+			}
+		}
+
+		if u != nil {
+			// User is logged in, so show the Pad
+			return handleViewPad(app, w, r)
+		}
+
+		if app.cfg.App.Private {
+			return viewLogin(app, w, r)
+		}
+
+		if land := app.cfg.App.LandingPath(); land != "/" {
+			return impart.HTTPError{http.StatusFound, land}
+		}
+	}
+
+	return handleViewLanding(app, w, r)
+}
+
+func handleViewLanding(app *App, w http.ResponseWriter, r *http.Request) error {
+	forceLanding := r.FormValue("landing") == "1"
+
+	p := struct {
+		page.StaticPage
+		*OAuthButtons
+		Flashes []template.HTML
+		Banner  template.HTML
+		Content template.HTML
+
+		ForcedLanding bool
+	}{
+		StaticPage:    pageForReq(app, r),
+		OAuthButtons:  NewOAuthButtons(app.Config()),
+		ForcedLanding: forceLanding,
+	}
+
+	banner, err := getLandingBanner(app)
+	if err != nil {
+		log.Error("unable to get landing banner: %v", err)
+		return impart.HTTPError{http.StatusInternalServerError, fmt.Sprintf("Could not get banner: %v", err)}
+	}
+	p.Banner = template.HTML(applyMarkdown([]byte(banner.Content), "", app.cfg))
+
+	content, err := getLandingBody(app)
+	if err != nil {
+		log.Error("unable to get landing content: %v", err)
+		return impart.HTTPError{http.StatusInternalServerError, fmt.Sprintf("Could not get content: %v", err)}
+	}
+	p.Content = template.HTML(applyMarkdown([]byte(content.Content), "", app.cfg))
+
+	// Get error messages
+	session, err := app.sessionStore.Get(r, cookieName)
+	if err != nil {
+		// Ignore this
+		log.Error("Unable to get session in handleViewHome; ignoring: %v", err)
+	}
+	flashes, _ := getSessionFlashes(app, w, r, session)
+	for _, flash := range flashes {
+		p.Flashes = append(p.Flashes, template.HTML(flash))
+	}
+
+	// Show landing page
+	return renderPage(w, "landing.tmpl", p)
+}
+
+func handleTemplatedPage(app *App, w http.ResponseWriter, r *http.Request, t *template.Template) error {
+	p := struct {
+		page.StaticPage
+		ContentTitle string
+		Content      template.HTML
+		PlainContent string
+		Updated      string
+
+		AboutStats *InstanceStats
+	}{
+		StaticPage: pageForReq(app, r),
+	}
+	if r.URL.Path == "/about" || r.URL.Path == "/contact" || r.URL.Path == "/privacy" {
+		var c *instanceContent
+		var err error
+
+		if r.URL.Path == "/about" {
+			c, err = getAboutPage(app)
+
+			// Fetch stats
+			p.AboutStats = &InstanceStats{}
+			p.AboutStats.NumPosts, _ = app.db.GetTotalPosts()
+			p.AboutStats.NumBlogs, _ = app.db.GetTotalCollections()
+		} else if r.URL.Path == "/contact" {
+			c, err = getContactPage(app)
+			if c.Updated.IsZero() {
+				// Page was never set up, so return 404
+				return ErrPostNotFound
+			}
+		} else {
+			c, err = getPrivacyPage(app)
+		}
+
+		if err != nil {
+			return err
+		}
+		p.ContentTitle = c.Title.String
+		p.Content = template.HTML(applyMarkdown([]byte(c.Content), "", app.cfg))
+		p.PlainContent = shortPostDescription(stripmd.Strip(c.Content))
+		if !c.Updated.IsZero() {
+			p.Updated = c.Updated.Format("January 2, 2006")
+		}
+	}
+
+	// Serve templated page
+	err := t.ExecuteTemplate(w, "base", p)
+	if err != nil {
+		log.Error("Unable to render page: %v", err)
+	}
+	return nil
+}
+
+func pageForReq(app *App, r *http.Request) page.StaticPage {
+	p := page.StaticPage{
+		AppCfg:  app.cfg.App,
+		Path:    r.URL.Path,
+		Version: "v" + softwareVer,
+	}
+
+	// Use custom style, if file exists
+	if _, err := os.Stat(filepath.Join(app.cfg.Server.StaticParentDir, staticDir, "local", "custom.css")); err == nil {
+		p.CustomCSS = true
+	}
+
+	// Add user information, if given
+	var u *User
+	accessToken := r.FormValue("t")
+	if accessToken != "" {
+		userID := app.db.GetUserID(accessToken)
+		if userID != -1 {
+			var err error
+			u, err = app.db.GetUserByID(userID)
+			if err == nil {
+				p.Username = u.Username
+			}
+		}
+	} else {
+		u = getUserSession(app, r)
+		if u != nil {
+			p.Username = u.Username
+			p.IsAdmin = u != nil && u.IsAdmin()
+			p.CanInvite = canUserInvite(app.cfg, p.IsAdmin)
+			if p.IsAdmin && app.updates != nil {
+				p.UpdateAvailable = app.updates.AreAvailableNoCheck()
+			}
+		}
+	}
+	p.CanViewReader = !app.cfg.App.Private || u != nil
+
+	return p
+}
+
+var fileRegex = regexp.MustCompile("/([^/]*\\.[^/]*)$")
+
+// Initialize loads the app configuration and initializes templates, keys,
+// session, route handlers, and the database connection.
+func Initialize(apper Apper, debug bool) (*App, error) {
+	debugging = debug
+
+	// Ensure a configuration file exists first, for a nicer error message
+	if _, err := os.Stat(apper.App().cfgFile); os.IsNotExist(err) {
+		flagOpt := ""
+		loc := " yet"
+		if apper.App().cfgFile != config.FileName {
+			flagOpt = " -c " + apper.App().cfgFile
+			loc = " at " + apper.App().cfgFile
+		}
+		return nil, fmt.Errorf("No configuration file%s. To create, run:\n  writefreely%s config start", loc, flagOpt)
+	}
+
+	apper.LoadConfig()
+
+	// Load templates
+	err := InitTemplates(apper.App().Config())
+	if err != nil {
+		return nil, fmt.Errorf("load templates: %s", err)
+	}
+
+	// Load keys and set up session
+	initKeyPaths(apper.App()) // TODO: find a better way to do this, since it's unneeded in all Apper implementations
+	err = InitKeys(apper)
+	if err != nil {
+		return nil, fmt.Errorf("init keys: %s", err)
+	}
+	apper.App().InitUpdates()
+
+	apper.App().InitSession()
+
+	apper.App().InitDecoder()
+
+	err = ConnectToDatabase(apper.App())
+	if err != nil {
+		return nil, fmt.Errorf("connect to DB: %s", err)
+	}
+
+	initActivityPub(apper.App())
+
+	if apper.App().cfg.Email.Enabled() {
+		log.Info("Starting publish jobs queue...")
+		go startPublishJobsQueue(apper.App())
+	} else {
+		log.Info("[jobs] Not starting publish jobs queue: no email provider is configured.")
+	}
+
+	// Handle local timeline, if enabled
+	if apper.App().cfg.App.LocalTimeline {
+		log.Info("Initializing local timeline...")
+		initLocalTimeline(apper.App())
+	}
+
+	return apper.App(), nil
+}
+
+func Serve(app *App, r *mux.Router) {
+	log.Info("Going to serve...")
+
+	isSingleUser = app.cfg.App.SingleUser
+	app.cfg.Server.Dev = debugging
+
+	// Handle shutdown
+	c := make(chan os.Signal, 2)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		log.Info("Shutting down...")
+		shutdown(app)
+		log.Info("Done.")
+		os.Exit(0)
+	}()
+
+	// Start gopher server
+	if app.cfg.Server.GopherPort > 0 && !app.cfg.App.Private {
+		go initGopher(app)
+	}
+
+	// Start web application server
+	var bindAddress = app.cfg.Server.Bind
+	if bindAddress == "" {
+		bindAddress = "localhost"
+	}
+	var err error
+	if app.cfg.IsSecureStandalone() {
+		if app.cfg.Server.Autocert {
+			m := &autocert.Manager{
+				Prompt: autocert.AcceptTOS,
+				Cache:  autocert.DirCache(app.cfg.Server.TLSCertPath),
+			}
+			host, err := url.Parse(app.cfg.App.Host)
+			if err != nil {
+				log.Error("[WARNING] Unable to parse configured host! %s", err)
+				log.Error(`[WARNING] ALL hosts are allowed, which can open you to an attack where
+clients connect to a server by IP address and pretend to be asking for an
+incorrect host name, and cause you to reach the CA's rate limit for certificate
+requests. We recommend supplying a valid host name.`)
+				log.Info("Using autocert on ANY host")
+			} else {
+				log.Info("Using autocert on host %s", host.Host)
+				m.HostPolicy = autocert.HostWhitelist(host.Host)
+			}
+			s := &http.Server{
+				Addr:    ":https",
+				Handler: r,
+				TLSConfig: &tls.Config{
+					GetCertificate: m.GetCertificate,
+				},
+			}
+			s.SetKeepAlivesEnabled(false)
+
+			go func() {
+				log.Info("Serving redirects on http://%s:80", bindAddress)
+				err = http.ListenAndServe(":80", m.HTTPHandler(nil))
+				log.Error("Unable to start redirect server: %v", err)
+			}()
+
+			log.Info("Serving on https://%s:443", bindAddress)
+			log.Info("---")
+			err = s.ListenAndServeTLS("", "")
+		} else {
+			go func() {
+				log.Info("Serving redirects on http://%s:80", bindAddress)
+				err = http.ListenAndServe(fmt.Sprintf("%s:80", bindAddress), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, app.cfg.App.Host, http.StatusMovedPermanently)
+				}))
+				log.Error("Unable to start redirect server: %v", err)
+			}()
+
+			log.Info("Serving on https://%s:443", bindAddress)
+			log.Info("Using manual certificates")
+			log.Info("---")
+			err = http.ListenAndServeTLS(fmt.Sprintf("%s:443", bindAddress), app.cfg.Server.TLSCertPath, app.cfg.Server.TLSKeyPath, r)
+		}
+	} else {
+		network := "tcp"
+		protocol := "http"
+		if strings.HasPrefix(bindAddress, "/") {
+			network = "unix"
+			protocol = "http+unix"
+
+			// old sockets will remain after server closes;
+			// we need to delete them in order to open new ones
+			err = os.Remove(bindAddress)
+			if err != nil && !os.IsNotExist(err) {
+				log.Error("%s already exists but could not be removed: %v", bindAddress, err)
+				os.Exit(1)
+			}
+		} else {
+			bindAddress = fmt.Sprintf("%s:%d", bindAddress, app.cfg.Server.Port)
+		}
+
+		log.Info("Serving on %s://%s", protocol, bindAddress)
+		log.Info("---")
+		listener, err := net.Listen(network, bindAddress)
+		if err != nil {
+			log.Error("Could not bind to address: %v", err)
+			os.Exit(1)
+		}
+
+		if network == "unix" {
+			err = os.Chmod(bindAddress, 0o666)
+			if err != nil {
+				log.Error("Could not update socket permissions: %v", err)
+				os.Exit(1)
+			}
+		}
+
+		defer listener.Close()
+		err = http.Serve(listener, r)
+	}
+	if err != nil {
+		log.Error("Unable to start: %v", err)
+		os.Exit(1)
+	}
+}
+
+func (app *App) InitDecoder() {
+	// TODO: do this at the package level, instead of the App level
+	// Initialize modules
+	app.formDecoder = schema.NewDecoder()
+	// Ignore fields like the CSRF token that forms submit but that don't
+	// map to any decoded struct.
+	app.formDecoder.IgnoreUnknownKeys(true)
+	app.formDecoder.RegisterConverter(converter.NullJSONString{}, converter.ConvertJSONNullString)
+	app.formDecoder.RegisterConverter(converter.NullJSONBool{}, converter.ConvertJSONNullBool)
+	app.formDecoder.RegisterConverter(sql.NullString{}, converter.ConvertSQLNullString)
+	app.formDecoder.RegisterConverter(sql.NullBool{}, converter.ConvertSQLNullBool)
+	app.formDecoder.RegisterConverter(sql.NullInt64{}, converter.ConvertSQLNullInt64)
+	app.formDecoder.RegisterConverter(sql.NullFloat64{}, converter.ConvertSQLNullFloat64)
+}
+
+// ConnectToDatabase validates and connects to the configured database, then
+// tests the connection.
+func ConnectToDatabase(app *App) error {
+	// Check database configuration
+	if app.cfg.Database.Type == driverMySQL && app.cfg.Database.User == "" {
+		return fmt.Errorf("Database user not set.")
+	}
+	if app.cfg.Database.Host == "" {
+		app.cfg.Database.Host = "localhost"
+	}
+	if app.cfg.Database.Database == "" {
+		app.cfg.Database.Database = "writefreely"
+	}
+
+	// TODO: check err
+	connectToDatabase(app)
+
+	// Test database connection
+	err := app.db.Ping()
+	if err != nil {
+		return fmt.Errorf("Database ping failed: %s", err)
+	}
+	log.Info("Connected to database.")
+
+	ver, err := app.db.version()
+	if err != nil {
+		log.Error("Unable to get DB version: %v", err)
+	} else {
+		log.Info("Database version: %v", ver)
+		if app.cfg.Database.Type == driverMySQL && strings.HasPrefix(ver, "5.") {
+			log.Info("Enabling compatibility for MySQL v5.x")
+			app.db.useSpencerRegex = true
+		}
+	}
+
+	// Ensure the database schema is up-to-date
+	var dbVer int
+	err = app.db.QueryRow("SELECT MAX(version) FROM appmigrations").Scan(&dbVer)
+	if err != nil {
+		log.Error("Unable to read migrations version: %v", err)
+	} else if dbVer < migrations.CurrentVer() {
+		log.Info("+--------------------------------------------------------------------------+")
+		log.Info("| IMPORTANT! There are pending migrations (%d). Run: writefreely db migrate |", migrations.CurrentVer()-dbVer)
+		log.Info("+--------------------------------------------------------------------------+")
+	}
+
+	return nil
+}
+
+// FormatVersion constructs the version string for the application
+func FormatVersion() string {
+	return serverSoftware + " " + softwareVer
+}
+
+// OutputVersion prints out the version of the application.
+func OutputVersion() {
+	fmt.Println(FormatVersion())
+}
+
+// NewApp creates a new app instance.
+func NewApp(cfgFile string) *App {
+	return &App{
+		cfgFile: cfgFile,
+	}
+}
+
+// CreateConfig creates a default configuration and saves it to the app's cfgFile.
+func CreateConfig(app *App) error {
+	log.Info("Creating configuration...")
+	c := config.New()
+	log.Info("Saving configuration %s...", app.cfgFile)
+	err := config.Save(c, app.cfgFile)
+	if err != nil {
+		return fmt.Errorf("Unable to save configuration: %v", err)
+	}
+	return nil
+}
+
+// DoConfig runs the interactive configuration process.
+func DoConfig(app *App, configSections string) {
+	if configSections == "" {
+		configSections = "server db app"
+	}
+	// let's check there aren't any garbage in the list
+	configSectionsArray := strings.Split(configSections, " ")
+	for _, element := range configSectionsArray {
+		if element != "server" && element != "db" && element != "app" {
+			log.Error("Invalid argument to --sections. Valid arguments are only \"server\", \"db\" and \"app\"")
+			os.Exit(1)
+		}
+	}
+	d, err := config.Configure(app.cfgFile, configSections)
+	if err != nil {
+		log.Error("Unable to configure: %v", err)
+		os.Exit(1)
+	}
+	app.cfg = d.Config
+	connectToDatabase(app)
+	defer shutdown(app)
+
+	if !app.db.DatabaseInitialized() {
+		err = adminInitDatabase(app)
+		if err != nil {
+			log.Error(err.Error())
+			os.Exit(1)
+		}
+	} else {
+		log.Info("Database already initialized.")
+	}
+
+	if d.User != nil {
+		u := &User{
+			Username:   d.User.Username,
+			HashedPass: d.User.HashedPass,
+			Created:    time.Now().Truncate(time.Second).UTC(),
+		}
+
+		// Create blog
+		log.Info("Creating user %s...\n", u.Username)
+		err = app.db.CreateUser(app.cfg, u, app.cfg.App.SiteName, "")
+		if err != nil {
+			log.Error("Unable to create user: %s", err)
+			os.Exit(1)
+		}
+		log.Info("Done!")
+	}
+	os.Exit(0)
+}
+
+// GenerateKeyFiles creates app encryption keys and saves them into the configured KeysParentDir.
+func GenerateKeyFiles(app *App) error {
+	// Read keys path from config
+	app.LoadConfig()
+
+	// Create keys dir if it doesn't exist yet
+	fullKeysDir := filepath.Join(app.cfg.Server.KeysParentDir, keysDir)
+	if _, err := os.Stat(fullKeysDir); os.IsNotExist(err) {
+		err = os.Mkdir(fullKeysDir, 0700)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Generate keys
+	initKeyPaths(app)
+	// TODO: use something like https://github.com/hashicorp/go-multierror to return errors
+	var keyErrs error
+	err := generateKey(emailKeyPath)
+	if err != nil {
+		keyErrs = err
+	}
+	err = generateKey(cookieAuthKeyPath)
+	if err != nil {
+		keyErrs = err
+	}
+	err = generateKey(cookieKeyPath)
+	if err != nil {
+		keyErrs = err
+	}
+	err = generateKey(csrfKeyPath)
+	if err != nil {
+		keyErrs = err
+	}
+
+	return keyErrs
+}
+
+// CreateSchema creates all database tables needed for the application.
+func CreateSchema(apper Apper) error {
+	apper.LoadConfig()
+	connectToDatabase(apper.App())
+	defer shutdown(apper.App())
+	err := adminInitDatabase(apper.App())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Migrate runs all necessary database migrations.
+func Migrate(apper Apper) error {
+	apper.LoadConfig()
+	connectToDatabase(apper.App())
+	defer shutdown(apper.App())
+
+	err := migrations.Migrate(migrations.NewDatastore(apper.App().db.DB, apper.App().db.driverName))
+	if err != nil {
+		return fmt.Errorf("migrate: %s", err)
+	}
+	return nil
+}
+
+// ResetPassword runs the interactive password reset process.
+func ResetPassword(apper Apper, username string) error {
+	// Connect to the database
+	apper.LoadConfig()
+	connectToDatabase(apper.App())
+	defer shutdown(apper.App())
+
+	// Fetch user
+	u, err := apper.App().db.GetUserForAuth(username)
+	if err != nil {
+		log.Error("Get user: %s", err)
+		os.Exit(1)
+	}
+
+	// Prompt for new password
+	prompt := promptui.Prompt{
+		Templates: &promptui.PromptTemplates{
+			Success: "{{ . | bold | faint }}: ",
+		},
+		Label: "New password",
+		Mask:  '*',
+	}
+	newPass, err := prompt.Run()
+	if err != nil {
+		log.Error("%s", err)
+		os.Exit(1)
+	}
+
+	// Do the update
+	log.Info("Updating...")
+	err = adminResetPassword(apper.App(), u, newPass)
+	if err != nil {
+		log.Error("%s", err)
+		os.Exit(1)
+	}
+	log.Info("Success.")
+	return nil
+}
+
+// DoDeleteAccount runs the confirmation and account delete process.
+func DoDeleteAccount(apper Apper, username string) error {
+	// Connect to the database
+	apper.LoadConfig()
+	connectToDatabase(apper.App())
+	defer shutdown(apper.App())
+
+	// check user exists
+	u, err := apper.App().db.GetUserForAuth(username)
+	if err != nil {
+		log.Error("%s", err)
+		os.Exit(1)
+	}
+	userID := u.ID
+
+	// do not delete the admin account
+	// TODO: check for other admins and skip?
+	if u.IsAdmin() {
+		log.Error("Can not delete admin account")
+		os.Exit(1)
+	}
+
+	// confirm deletion, w/ w/out posts
+	prompt := promptui.Prompt{
+		Templates: &promptui.PromptTemplates{
+			Success: "{{ . | bold | faint }}: ",
+		},
+		Label:     fmt.Sprintf("Really delete user : %s", username),
+		IsConfirm: true,
+	}
+	_, err = prompt.Run()
+	if err != nil {
+		log.Info("Aborted...")
+		os.Exit(0)
+	}
+
+	log.Info("Deleting...")
+	err = apper.App().db.DeleteAccount(userID)
+	if err != nil {
+		log.Error("%s", err)
+		os.Exit(1)
+	}
+	log.Info("Success.")
+	return nil
+}
+
+// UserAction is a bulk moderation action applied to a filtered set of users.
+type UserAction int
+
+const (
+	// ActionList only prints matching users, changing nothing.
+	ActionList UserAction = iota
+	// ActionSilence silences all matching users.
+	ActionSilence
+	// ActionDelete permanently deletes all matching users and their content.
+	ActionDelete
+)
+
+// ModerateUsers lists users matching the given filter and, when action is
+// ActionSilence or ActionDelete, applies that action to the whole set after a
+// single confirmation prompt. It's the backend for the `users` command,
+// intended for cleaning up waves of spam signups.
+func ModerateUsers(apper Apper, filter UserFilter, action UserAction) error {
+	// Connect to the database
+	apper.LoadConfig()
+	connectToDatabase(apper.App())
+	defer shutdown(apper.App())
+
+	app := apper.App()
+
+	// Admins are only ever included when listing; silence/delete must never
+	// touch them, regardless of the filter passed in.
+	filter.IncludeAdmins = action == ActionList
+
+	users, err := app.db.GetUsersFiltered(filter)
+	if err != nil {
+		log.Error("%s", err)
+		os.Exit(1)
+	}
+
+	// Print the matching users
+	fmt.Printf("Matched %d users:\n", len(users))
+	if len(users) > 0 {
+		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tUSERNAME\tCREATED\tPOSTS\tSTATUS")
+		for _, u := range users {
+			status := ""
+			if u.IsAdmin() {
+				status = "admin"
+			} else if u.IsSilenced() {
+				status = "silenced"
+			}
+			fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%s\n", u.ID, u.Username, u.Created.Format("2006-01-02 15:04 MST"), u.PostCount, status)
+		}
+		w.Flush()
+	}
+	fmt.Printf("(%d total)\n", len(users))
+
+	// List-only: nothing more to do
+	if action == ActionList {
+		return nil
+	}
+
+	// Nothing to act on
+	if len(users) == 0 {
+		log.Info("No users to act on.")
+		return nil
+	}
+
+	// Confirm the action, echoing the count and verb
+	verb := "SILENCE"
+	if action == ActionDelete {
+		verb = "DELETE"
+	}
+	label := fmt.Sprintf("Really %s %d users", verb, len(users))
+	if action == ActionDelete {
+		label += " and all their content? This cannot be undone"
+	}
+	prompt := promptui.Prompt{
+		Templates: &promptui.PromptTemplates{
+			Success: "{{ . | bold | faint }}: ",
+		},
+		Label:     label,
+		IsConfirm: true,
+	}
+	if _, err = prompt.Run(); err != nil {
+		log.Info("Aborted...")
+		return nil
+	}
+
+	// Apply the action, isolating per-user errors so one failure doesn't
+	// halt the whole batch.
+	log.Info("Working...")
+	var done, failed int
+	for _, u := range users {
+		switch action {
+		case ActionSilence:
+			err = app.db.SetUserStatus(u.ID, UserSilenced)
+		case ActionDelete:
+			err = app.db.DeleteAccount(u.ID)
+		}
+		if err != nil {
+			log.Error("Failed on user %s (%d): %v", u.Username, u.ID, err)
+			failed++
+			continue
+		}
+		done++
+	}
+
+	// Silenced users' posts may be cached in the timeline; refresh it once.
+	if action == ActionSilence && done > 0 && app.timeline != nil {
+		updateTimelineCache(app.timeline, true)
+	}
+
+	log.Info("Done. %d/%d succeeded, %d errors.", done, len(users), failed)
+	return nil
+}
+
+func connectToDatabase(app *App) {
+	log.Info("Connecting to %s database...", app.cfg.Database.Type)
+
+	var db *sql.DB
+	var err error
+	if app.cfg.Database.Type == driverMySQL {
+		db, err = sql.Open(app.cfg.Database.Type, fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true&loc=%s&tls=%t", app.cfg.Database.User, app.cfg.Database.Password, app.cfg.Database.Host, app.cfg.Database.Port, app.cfg.Database.Database, url.QueryEscape(time.Local.String()), app.cfg.Database.TLS))
+		db.SetMaxOpenConns(50)
+	} else if app.cfg.Database.Type == driverSQLite {
+		if !SQLiteEnabled {
+			log.Error("Invalid database type '%s'. Binary wasn't compiled with SQLite3 support.", app.cfg.Database.Type)
+			os.Exit(1)
+		}
+		if app.cfg.Database.FileName == "" {
+			log.Error("SQLite database filename value in config.ini is empty.")
+			os.Exit(1)
+		}
+		db, err = sql.Open("sqlite3_with_regex", app.cfg.Database.FileName+"?parseTime=true&cached=shared")
+		db.SetMaxOpenConns(2)
+	} else {
+		log.Error("Invalid database type '%s'. Only 'mysql' and 'sqlite3' are supported right now.", app.cfg.Database.Type)
+		os.Exit(1)
+	}
+	if err != nil {
+		log.Error("%s", err)
+		os.Exit(1)
+	}
+	app.db = &datastore{DB: db, driverName: app.cfg.Database.Type}
+}
+
+func shutdown(app *App) {
+	log.Info("Closing database connection...")
+	app.db.Close()
+	if strings.HasPrefix(app.cfg.Server.Bind, "/") {
+		// Clean up socket
+		log.Info("Removing socket file...")
+		err := os.Remove(app.cfg.Server.Bind)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Safely ignore, in cases like initializing / migrating DB (see #790)
+				log.Info("No socket file; ignoring...")
+			} else {
+				log.Error("Unable to remove socket: %s", err)
+				os.Exit(1)
+			}
+		}
+		log.Info("Success.")
+	}
+}
+
+// CreateUser creates a new admin or normal user from the given credentials.
+func CreateUser(apper Apper, username, password string, isAdmin bool) error {
+	// Create an admin user with --create-admin
+	apper.LoadConfig()
+	connectToDatabase(apper.App())
+	defer shutdown(apper.App())
+
+	// Ensure an admin / first user doesn't already exist
+	firstUser, _ := apper.App().db.GetUserByID(1)
+	if isAdmin {
+		// Abort if trying to create admin user, but one already exists
+		if firstUser != nil {
+			return fmt.Errorf("Admin user already exists (%s). Create a regular user with: writefreely user create [USER]:[PASSWORD]", firstUser.Username)
+		}
+	} else {
+		// Abort if trying to create regular user, but no admin exists yet
+		if firstUser == nil {
+			return fmt.Errorf("No admin user exists yet. Create an admin first with: writefreely user create --admin [USER]:[PASSWORD]")
+		}
+	}
+
+	// Create the user
+	// Normalize and validate username
+	desiredUsername := username
+	username = getSlug(username, "")
+
+	usernameDesc := username
+	if username != desiredUsername {
+		usernameDesc += " (originally: " + desiredUsername + ")"
+	}
+
+	if !author.IsValidUsername(apper.App().cfg, username) {
+		return fmt.Errorf("Username %s is invalid, reserved, or shorter than configured minimum length (%d characters).", usernameDesc, apper.App().cfg.App.MinUsernameLen)
+	}
+
+	if len(password) > maxPassByteLen {
+		return impart.HTTPError{http.StatusInternalServerError, fmt.Sprintf("Password is longer than %d characters", maxPassByteLen)}
+	}
+
+	// Hash the password
+	hashedPass, err := auth.HashPass([]byte(password))
+	if err != nil {
+		return fmt.Errorf("Unable to hash password: %v", err)
+	}
+
+	u := &User{
+		Username:   username,
+		HashedPass: hashedPass,
+		Created:    time.Now().Truncate(time.Second).UTC(),
+	}
+
+	userType := "user"
+	if isAdmin {
+		userType = "admin"
+	}
+	log.Info("Creating %s %s...", userType, usernameDesc)
+	err = apper.App().db.CreateUser(apper.App().Config(), u, desiredUsername, "")
+	if err != nil {
+		return fmt.Errorf("Unable to create user: %s", err)
+	}
+	log.Info("Done!")
+	return nil
+}
+
+//go:embed schema.sql
+var schemaSql string
+
+//go:embed sqlite.sql
+var sqliteSql string
+
+func adminInitDatabase(app *App) error {
+	var schema string
+	if app.cfg.Database.Type == driverSQLite {
+		schema = sqliteSql
+	} else {
+		schema = schemaSql
+	}
+
+	tblReg := regexp.MustCompile("CREATE TABLE (IF NOT EXISTS )?`([a-z_]+)`")
+
+	queries := strings.Split(string(schema), ";\n")
+	for _, q := range queries {
+		if strings.TrimSpace(q) == "" {
+			continue
+		}
+		parts := tblReg.FindStringSubmatch(q)
+		if len(parts) >= 3 {
+			log.Info("Creating table %s...", parts[2])
+		} else {
+			log.Info("Creating table ??? (Weird query) No match in: %v", parts)
+		}
+		_, err := app.db.Exec(q)
+		if err != nil {
+			log.Error("%s", err)
+		} else {
+			log.Info("Created.")
+		}
+	}
+
+	// Set up migrations table
+	log.Info("Initializing appmigrations table...")
+	err := migrations.SetInitialMigrations(migrations.NewDatastore(app.db.DB, app.db.driverName))
+	if err != nil {
+		return fmt.Errorf("Unable to set initial migrations: %v", err)
+	}
+
+	log.Info("Running migrations...")
+	err = migrations.Migrate(migrations.NewDatastore(app.db.DB, app.db.driverName))
+	if err != nil {
+		return fmt.Errorf("migrate: %s", err)
+	}
+
+	log.Info("Done.")
+	return nil
+}
+
+// ServerUserAgent returns a User-Agent string to use in external requests. The
+// hostName parameter may be left empty.
+func ServerUserAgent(hostName string) string {
+	hostUAStr := ""
+	if hostName != "" {
+		hostUAStr = "; +" + hostName
+	}
+	return "Go (" + serverSoftware + "/" + softwareVer + hostUAStr + ")"
+}

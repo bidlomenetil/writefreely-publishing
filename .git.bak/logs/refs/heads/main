@@ -1,0 +1,5 @@
+0000000000000000000000000000000000000000 f22dffb5978a15c20fa4a752ee96427dea4c70f9 Alinur Dzjeenbekov <alinurdzjeenbekov@gmail.com> 1793702693 +0500	commit (initial): chore: import upstream open-source source snapshot
+f22dffb5978a15c20fa4a752ee96427dea4c70f9 3bf17dc23ba5c0dc2b0bbf1b196536958ae55297 Alinur Dzjeenbekov <alinurdzjeenbekov@gmail.com> 1793704356 +0500	commit: fix(docker): initialize Compose services with the current CLI
+3bf17dc23ba5c0dc2b0bbf1b196536958ae55297 79e64c7f6904ef02b15e84fe79f6667b830919c5 Alinur Dzjeenbekov <alinurdzjeenbekov@gmail.com> 1793704624 +0500	commit: docs: explain source setup and preserve upstream attribution
+79e64c7f6904ef02b15e84fe79f6667b830919c5 2df117b20f55282c90df8e80965b6666dbeec30c Alinur Dzjeenbekov <alinurdzjeenbekov@gmail.com> 1793704633 +0500	commit: fix(docker): run initialization before the web service starts
+2df117b20f55282c90df8e80965b6666dbeec30c ad75175ce92e85b3d64979119e6bdfb7816f2c85 Alinur Dzjeenbekov <alinurdzjeenbekov@gmail.com> 1793763989 +0500	commit: Final commit

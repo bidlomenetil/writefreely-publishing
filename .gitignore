@@ -1,0 +1,12 @@
+node_modules
+*~
+*.swp
+*.swo
+
+static/local/custom.css
+build
+tmp
+*.ini
+*.db
+
+bindata.go
